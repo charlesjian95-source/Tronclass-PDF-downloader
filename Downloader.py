@@ -2,6 +2,7 @@ import requests
 from bs4 import BeautifulSoup
 import re
 import urllib3
+import sys
 
 # 關閉煩人的 SSL 憑證警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -33,7 +34,7 @@ def nsysu_ultimate_downloader(username, password, target_url):
     post_url = form.get('action') # 這就是帶有 session_code 的動態網址！
     print("🔓 [2/5] 成功攔截動態驗證網址，準備送出機密資料...")
     
-    # 3. 打包你的帳號密碼 (對應你截圖裡的 Form Data)
+    # 3. 打包你的帳號密碼
     login_data = {
         'username': username,
         'password': password
@@ -50,7 +51,7 @@ def nsysu_ultimate_downloader(username, password, target_url):
     print("✅ 登入成功！通行證已自動保存。")
 
     # ==========================================
-    # 階段二：無縫接軌檔案下載 (你之前寫好的完美邏輯)
+    # 階段二：無縫接軌檔案下載
     # ==========================================
     print(f"🔍 [3/5] 正在分析課程網址...")
     match = re.search(r'learning-activity#/(\d+)', target_url)
@@ -61,7 +62,7 @@ def nsysu_ultimate_downloader(username, password, target_url):
 
     print(f"🕵️ [4/5] 正在探索隱藏檔案 ID...")
     info_api = f"https://elearn.nsysu.edu.tw/api/activities/{activity_id}"
-    res_info = session.get(info_api, verify=False).json() # 注意這裡全部改用 session.get 了
+    res_info = session.get(info_api, verify=False).json() 
     
     try:
         file_id = res_info['uploads'][0]['reference_id']
@@ -84,14 +85,29 @@ def nsysu_ultimate_downloader(username, password, target_url):
     else:
         print("❌ 檔案下載失敗...")
 
-# ==========================================
-# 執行區
-# ==========================================
-my_id = ""
-my_pwd = ""  # ⚠️ 記得改密碼喔！
-target = "https://elearn.nsysu.edu.tw/course/29801/learning-activity#/66905"
+def main():
+    # ==========================================
+    # 執行區
+    # ==========================================
+    my_id = input("輸入學號: ")
+    my_pwd = input("輸入TronClass密碼: ")
+    target = input("輸入欲下載檔案網址: ")
+    nsysu_ultimate_downloader(my_id, my_pwd, target)
 
-my_id = input("輸入學號:")
-my_pwd = input("輸入TronClass密碼:")
-target = input("輸入欲下載檔案網址:")
-nsysu_ultimate_downloader(my_id, my_pwd, target)
+# 程式執行起點
+if __name__ == "__main__":
+    try:
+        main()
+        # 正常執行完畢後，暫停視窗
+        input("\n請按 Enter 鍵關閉視窗...")
+        
+    except Exception as e:
+        # 當發生任何錯誤時，攔截錯誤並顯示
+        print("\n" + "="*40)
+        print("❌ 程式執行過程中發生未預期錯誤：")
+        print(e)
+        print("="*40)
+        
+        # 發生錯誤後，暫停視窗讓使用者有時間閱讀錯誤訊息
+        input("\n請確認上方錯誤訊息後，按 Enter 鍵關閉視窗...")
+        sys.exit(1)
