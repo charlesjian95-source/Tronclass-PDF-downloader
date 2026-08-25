@@ -5,6 +5,7 @@
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 
 這是一個專為 **國立中山大學網路大學 (TronClass)** 設計的自動化下載工具。
+
 **🎉 全新 v1.0.0 版本已支援「免安裝執行檔」，不需具備任何程式基礎，雙擊即可直接使用！**
 
 ## ✨ Features (核心特色)
