@@ -20,6 +20,8 @@ app = ctk.CTk()
 app.geometry("550x550")
 app.title("TronClass 下載器 v2.0")
 
+CONFIG_FILE = "config.json"
+
 # ==========================================
 # 2. 爬蟲核心與狀態回報機制
 # ==========================================
@@ -104,10 +106,19 @@ def start_download_thread():
     user_id = entry_id.get()
     user_pwd = entry_pwd.get()
     target_url = entry_url.get()
+    remember = remember_var.get() # 取得是否有打勾
     
     if not user_id or not user_pwd or not target_url:
         update_log("⚠️請確實填寫學號、密碼與網址！")
         return
+
+    if remember:
+        data = {"username": user_id, "password": user_pwd, "remember": True}
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    else:
+        if os.path.exists(CONFIG_FILE):
+            os.remove(CONFIG_FILE)
         
     # 按下按鈕後，先鎖死按鈕，防止使用者瘋狂連點產生多個下載任務
     download_btn.configure(state="disabled", text="下載中...")
@@ -143,6 +154,23 @@ download_btn.pack(pady=20)
 log_box = ctk.CTkTextbox(app, width=450, height=180, font=("Arial", 13))
 log_box.pack(pady=10)
 log_box.insert("end", "歡迎使用！請輸入資料並點擊下載。\n")
+
+# ==========================================
+# 5. 啟動時自動讀取帳號密碼
+# ==========================================
+def load_credentials():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if data.get("remember"):
+                    entry_id.insert(0, data.get("username", ""))
+                    entry_pwd.insert(0, data.get("password", ""))
+                    remember_var.set(True)
+        except Exception as e:
+            update_log(f"⚠️ 讀取設定檔失敗: {e}")
+
+load_credentials() # 啟動時立刻執行讀取
 
 # 啟動應用程式
 app.mainloop()
