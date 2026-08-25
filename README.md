@@ -1,4 +1,4 @@
-# 🎓 NSYSU TronClass Downloader (中山大學網路大學終極下載器)
+# 🎓 NSYSU TronClass Downloader (中山大學網路大學下載器)
 
 ![Platform](https://img.shields.io/badge/Platform-Windows-blue.svg)
 ![Python](https://img.shields.io/badge/Python-3.x-blue.svg)
