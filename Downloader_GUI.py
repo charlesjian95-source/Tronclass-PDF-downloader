@@ -20,15 +20,20 @@ app = ctk.CTk()
 app.geometry("550x550")
 app.title("TronClass 下載器 v2.0")
 
+# 設定檔名稱
 CONFIG_FILE = "config.json"
 
 # ==========================================
 # 2. 爬蟲核心與狀態回報機制
 # ==========================================
-# 建立一個小工具，用來把原本的 print 訊息，推送到介面的文字框裡
+# [完美修復]：使用 app.after 確保跨執行緒安全，並控制唯讀狀態
 def update_log(message):
-    log_box.insert("end", message + "\n")
-    log_box.see("end")  # 自動捲動到最底端
+    def _update():
+        log_box.configure(state="normal")    # 寫入前先解鎖
+        log_box.insert("end", message + "\n")
+        log_box.see("end")  
+        log_box.configure(state="disabled")  # 寫完立刻鎖上
+    app.after(0, _update)
 
 def nsysu_ultimate_downloader(username, password, target_url):
     session = requests.Session()
@@ -83,9 +88,13 @@ def nsysu_ultimate_downloader(username, password, target_url):
         pdf_response = session.get(real_url, verify=False)
         
         if pdf_response.status_code == 200:
-            with open(file_name, "wb") as f:
+            # [完美修復]：過濾掉 Windows 不允許的特殊字元
+            safe_file_name = re.sub(r'[\\/:*?"<>|]', '_', file_name)
+            
+            with open(safe_file_name, "wb") as f:
                 f.write(pdf_response.content)
-            full_path = os.path.abspath(file_name)
+                
+            full_path = os.path.abspath(safe_file_name)
             update_log("🎉太神啦！檔案下載成功！")
             update_log(f"📁檔案位置:{full_path}")
             os.startfile(os.path.dirname(full_path))
@@ -96,8 +105,8 @@ def nsysu_ultimate_downloader(username, password, target_url):
         update_log(f"❌發生未預期的錯誤: {e}")
         
     finally:
-        # 下載結束後，把按鈕恢復為可點擊狀態
-        download_btn.configure(state="normal", text="開始下載")
+        # [完美修復]：確保按鈕恢復的動作也在主執行緒執行
+        app.after(0, lambda: download_btn.configure(state="normal", text="開始下載"))
 
 # ==========================================
 # 3. 按鈕觸發與執行緒分流
@@ -106,12 +115,12 @@ def start_download_thread():
     user_id = entry_id.get()
     user_pwd = entry_pwd.get()
     target_url = entry_url.get()
-    remember = remember_var.get() # 取得是否有打勾
+    remember = remember_var.get() 
     
     if not user_id or not user_pwd or not target_url:
         update_log("⚠️請確實填寫學號、密碼與網址！")
         return
-
+        
     if remember:
         data = {"username": user_id, "password": user_pwd, "remember": True}
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -119,12 +128,14 @@ def start_download_thread():
     else:
         if os.path.exists(CONFIG_FILE):
             os.remove(CONFIG_FILE)
-        
-    # 按下按鈕後，先鎖死按鈕，防止使用者瘋狂連點產生多個下載任務
+            
     download_btn.configure(state="disabled", text="下載中...")
-    log_box.delete("0.0", "end") # 清空之前的對話紀錄
     
-    # 建立一個背景工人（Thread），把下載任務交給他去跑
+    # 清空畫面時也要先解鎖再上鎖
+    log_box.configure(state="normal")
+    log_box.delete("0.0", "end") 
+    log_box.configure(state="disabled")
+    
     worker = threading.Thread(target=nsysu_ultimate_downloader, args=(user_id, user_pwd, target_url))
     worker.start()
 
@@ -150,10 +161,14 @@ entry_url.pack(pady=10)
 download_btn = ctk.CTkButton(app, text="開始下載", command=start_download_thread, width=350, font=("Arial", 14, "bold"))
 download_btn.pack(pady=20)
 
-# 狀態顯示文字框
-log_box = ctk.CTkTextbox(app, width=450, height=180, font=("Arial", 13))
+# [完美修復]：狀態顯示文字框，預設改為唯讀 (state="disabled")
+log_box = ctk.CTkTextbox(app, width=450, height=180, font=("Arial", 13), state="disabled")
 log_box.pack(pady=10)
+
+# 第一次寫入歡迎訊息
+log_box.configure(state="normal")
 log_box.insert("end", "歡迎使用！請輸入資料並點擊下載。\n")
+log_box.configure(state="disabled")
 
 # ==========================================
 # 5. 啟動時自動讀取帳號密碼
@@ -170,7 +185,7 @@ def load_credentials():
         except Exception as e:
             update_log(f"⚠️ 讀取設定檔失敗: {e}")
 
-load_credentials() # 啟動時立刻執行讀取
+load_credentials()
 
 # 啟動應用程式
 app.mainloop()
