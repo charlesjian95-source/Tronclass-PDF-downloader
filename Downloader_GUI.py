@@ -1,190 +1,221 @@
-import customtkinter as ctk
-import threading
-import requests
-from bs4 import BeautifulSoup
-import re
-import urllib3
-import os
+"""Desktop entry point. All Tk operations stay on the main thread."""
+
 import json
+import os
+from pathlib import Path
+import queue
+import sys
+import threading
+from tkinter import filedialog
 
-# 關閉 SSL 憑證警告
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import customtkinter as ctk
 
-# ==========================================
-# 1. 介面基礎設定
-# ==========================================
-ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("blue")
+from tronclass_client import Cancelled, TronClassClient, describe_error, parse_target
 
-app = ctk.CTk()
-app.geometry("550x550")
-app.title("TronClass 下載器 v2.0")
 
-# 設定檔名稱
-CONFIG_FILE = "config.json"
+APP_DIRECTORY = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 
-# ==========================================
-# 2. 爬蟲核心與狀態回報機制
-# ==========================================
-def update_log(message):
-    def _update():
-        log_box.configure(state="normal")    # 寫入前先解鎖
-        log_box.insert("end", message + "\n")
-        log_box.see("end")  
-        log_box.configure(state="disabled")  # 寫完立刻鎖上
-    app.after(0, _update)
 
-def nsysu_ultimate_downloader(username, password, target_url):
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    })
+class DownloaderApp(ctk.CTk):
+    def __init__(self, settings_directory=APP_DIRECTORY):
+        super().__init__()
+        self.title("TronClass 下載器 — 課程批次下載")
+        self.geometry("680x760")
+        self.minsize(620, 720)
+        self.config_file = Path(settings_directory) / "config.json"
+        self.events = queue.Queue()
+        self.cancel_event = threading.Event()
+        self.worker = None
+        self.last_directory = None
+        self.closing = False
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(9, weight=1)
 
-    try:
-        update_log("[1/5] 正在連接中山大學登入系統...")
-        gate_res = session.get("https://elearn.nsysu.edu.tw/login", verify=False)
-        
-        soup = BeautifulSoup(gate_res.text, 'html.parser')
-        form = soup.find('form')
-        
-        if not form:
-            update_log("❌ 找不到登入表單，可能是網站大改版！")
-            return
-            
-        post_url = form.get('action')
-        update_log("[2/5] 成功攔截動態驗證網址，準備送出機密資料...")
-        
-        login_res = session.post(post_url, data={'username': username, 'password': password}, verify=False)
-        
-        if "Invalid username or password" in login_res.text or "無效" in login_res.text:
-            update_log("❌ 登入失敗，請檢查學號或密碼！")
-            return
-            
-        update_log("✅ 登入成功！通行證已自動保存。")
+        ctk.CTkLabel(self, text="TronClass 教材下載器", font=("Arial", 24, "bold")).grid(row=0, column=0, pady=(20, 12))
+        account = ctk.CTkFrame(self)
+        account.grid(row=1, column=0, padx=24, sticky="ew")
+        account.grid_columnconfigure((0, 1), weight=1)
+        self.entry_id = ctk.CTkEntry(account, placeholder_text="學號")
+        self.entry_id.grid(row=0, column=0, padx=12, pady=12, sticky="ew")
+        self.entry_pwd = ctk.CTkEntry(account, placeholder_text="TronClass 密碼", show="*")
+        self.entry_pwd.grid(row=0, column=1, padx=12, pady=12, sticky="ew")
+        self.remember = ctk.BooleanVar(value=False)
+        self.remember_box = ctk.CTkCheckBox(account, text="記住帳密（儲存在本機 config.json，未加密）", variable=self.remember,
+                                         checkbox_width=16, checkbox_height=16, font=("Arial", 12))
+        self.remember_box.grid(row=1, column=0, columnspan=2, padx=12, pady=(0, 12), sticky="w")
 
-        update_log("[3/5] 正在分析課程網址...")
-        match = re.search(r'learning-activity#/(\d+)', target_url)
-        if not match:
-            update_log("❌ 網址格式錯誤，請確認網址包含 learning-activity")
-            return
-        activity_id = match.group(1)
+        self.mode = ctk.CTkSegmentedButton(self, values=["整門課教材", "單一活動附件"])
+        self.mode.set("整門課教材")
+        self.mode.grid(row=2, column=0, padx=24, pady=(18, 10), sticky="ew")
+        self.entry_url = ctk.CTkEntry(self, placeholder_text="貼上課程網址，或 learning-activity 網址", height=36)
+        self.entry_url.grid(row=3, column=0, padx=24, sticky="ew")
+        ctk.CTkLabel(self, text="整門課模式會整理全部活動的文件附件；不含影片、外部連結及線上測驗內容。",
+                     font=("Arial", 12), wraplength=580).grid(row=4, column=0, padx=24, pady=(6, 12), sticky="w")
 
-        update_log("[4/5] 正在探索隱藏檔案 ID...")
-        info_api = f"https://elearn.nsysu.edu.tw/api/activities/{activity_id}"
-        res_info = session.get(info_api, verify=False).json()
-        
+        folder = ctk.CTkFrame(self, fg_color="transparent")
+        folder.grid(row=5, column=0, padx=24, sticky="ew")
+        folder.grid_columnconfigure(0, weight=1)
+        self.output = ctk.CTkEntry(folder)
+        self.output.insert(0, str(Path(settings_directory) / "downloads"))
+        self.output.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.browse_btn = ctk.CTkButton(folder, text="選擇資料夾", width=100, command=self.choose_folder)
+        self.browse_btn.grid(row=0, column=1)
+
+        buttons = ctk.CTkFrame(self, fg_color="transparent")
+        buttons.grid(row=6, column=0, padx=24, pady=16, sticky="ew")
+        buttons.grid_columnconfigure((0, 1, 2), weight=1)
+        self.download_btn = ctk.CTkButton(buttons, text="開始下載", command=self.start_download)
+        self.download_btn.grid(row=0, column=0, padx=(0, 6), sticky="ew")
+        self.cancel_btn = ctk.CTkButton(buttons, text="取消", state="disabled", command=self.cancel_download)
+        self.cancel_btn.grid(row=0, column=1, padx=6, sticky="ew")
+        self.retry_btn = ctk.CTkButton(buttons, text="重新掃描並重試", state="disabled", command=self.start_download)
+        self.retry_btn.grid(row=0, column=2, padx=(6, 0), sticky="ew")
+        self.progress = ctk.CTkProgressBar(self)
+        self.progress.set(0)
+        self.progress.grid(row=7, column=0, padx=24, sticky="ew")
+        self.status = ctk.CTkLabel(self, text="準備就緒", wraplength=600, anchor="w")
+        self.status.grid(row=8, column=0, padx=24, pady=8, sticky="ew")
+        self.log_box = ctk.CTkTextbox(self, state="disabled", height=190)
+        self.log_box.grid(row=9, column=0, padx=24, sticky="nsew")
+        self.open_btn = ctk.CTkButton(self, text="開啟下載資料夾", state="disabled", command=self.open_folder)
+        self.open_btn.grid(row=10, column=0, pady=16)
+        self.inputs = [self.entry_id, self.entry_pwd, self.remember_box, self.mode, self.entry_url, self.output, self.browse_btn]
+        self.load_credentials()
+        self.log("貼上網址後開始下載。重試會重新讀取清單，並略過已完成且校驗一致的附件。")
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.after(80, self.poll_events)
+
+    def log(self, message):
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", message + "\n")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
+    def choose_folder(self):
+        selected = filedialog.askdirectory(parent=self, title="選擇教材儲存位置")
+        if selected:
+            self.output.delete(0, "end")
+            self.output.insert(0, selected)
+
+    def load_credentials(self):
         try:
-            file_id = res_info['uploads'][0]['reference_id']
-            file_name = res_info['uploads'][0]['name']
-        except (KeyError, IndexError):
-            update_log("❌ 找不到檔案 ID，此頁面可能沒有夾帶檔案。")
-            return
+            data = json.loads(self.config_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("remember"):
+                self.entry_id.insert(0, str(data.get("username", "")))
+                self.entry_pwd.insert(0, str(data.get("password", "")))
+                self.remember.set(True)
+        except FileNotFoundError:
+            pass
+        except (ValueError, OSError):
+            self.log("讀取帳密設定失敗，請重新輸入。")
 
-        update_log(f"[5/5] 取得真實網址並開始下載: {file_name}")
-        download_api = f"https://elearn.nsysu.edu.tw/api/uploads/reference/document/{file_id}/url?preview=true&refer_id={activity_id}&refer_type=learning_activity"
-        real_url = session.get(download_api, verify=False).json()['url']
-        
-        pdf_response = session.get(real_url, verify=False)
-        
-        if pdf_response.status_code == 200:
-            # [完美修復]：過濾掉 Windows 不允許的特殊字元
-            safe_file_name = re.sub(r'[\\/:*?"<>|]', '_', file_name)
-            
-            with open(safe_file_name, "wb") as f:
-                f.write(pdf_response.content)
-                
-            full_path = os.path.abspath(safe_file_name)
-            update_log("🎉太神啦！檔案下載成功！")
-            update_log(f"📁檔案位置:{full_path}")
-            os.startfile(os.path.dirname(full_path))
+    def start_download(self):
+        if self.worker is not None and self.worker.is_alive():
+            return
+        username, password = self.entry_id.get().strip(), self.entry_pwd.get()
+        target, root = self.entry_url.get().strip(), self.output.get().strip()
+        whole_course = self.mode.get() == "整門課教材"
+        if not all((username, password, target, root)):
+            self.log("請填寫學號、密碼、網址及儲存位置。")
+            return
+        try:
+            _, activity = parse_target(target)
+            if not whole_course and activity is None:
+                self.log("單一活動模式請貼上包含 learning-activity#/活動ID 的網址。")
+                return
+            Path(root).mkdir(parents=True, exist_ok=True)
+            if self.remember.get():
+                self.config_file.write_text(json.dumps({"username": username, "password": password, "remember": True}), encoding="utf-8")
+            else:
+                self.config_file.unlink(missing_ok=True)
+        except Exception as error:
+            self.log(describe_error(error))
+            return
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+        self.cancel_event.clear()
+        self.progress.set(0)
+        self.status.configure(text="正在登入…")
+        for widget in self.inputs:
+            widget.configure(state="disabled")
+        self.download_btn.configure(state="disabled")
+        self.retry_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="normal")
+        self.worker = threading.Thread(target=self.run_worker, args=(username, password, target, root, whole_course), daemon=True)
+        self.worker.start()
+
+    def run_worker(self, username, password, target, root, whole_course):
+        client = TronClassClient(cancel=self.cancel_event, emit=lambda kind, value: self.events.put((kind, value)))
+        try:
+            client.login(username, password)
+            result = client.run(target, root, whole_course)
+            self.events.put(("result", result))
+        except Cancelled:
+            self.events.put(("status", "已取消"))
+        except Exception as error:
+            self.events.put(("log", describe_error(error)))
+            self.events.put(("status", "未完成，請查看下方訊息後重試。"))
+        finally:
+            client.close()
+            self.events.put(("done", None))
+
+    def poll_events(self):
+        for _ in range(100):
+            try:
+                kind, value = self.events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "log":
+                self.log(value)
+            elif kind == "status":
+                self.status.configure(text=value)
+            elif kind == "progress":
+                completed, total = value
+                self.progress.set(completed / total if total else 0)
+            elif kind == "result":
+                label = "已取消" if value.cancelled else "處理結束（部分失敗）" if value.failures else "處理完成"
+                summary = f"{label}：下載 {value.downloaded}、略過 {value.skipped}、失敗 {len(value.failures)}"
+                self.status.configure(text=summary)
+                self.log(summary)
+                if value.excluded:
+                    self.log(f"另有 {value.excluded} 個影音附件不在本次文件下載範圍。")
+                self.log(f"檔案與下載報告：{value.directory}")
+                self.last_directory = value.directory
+                self.open_btn.configure(state="normal")
+            elif kind == "done":
+                for widget in self.inputs:
+                    widget.configure(state="normal")
+                self.download_btn.configure(state="normal")
+                self.retry_btn.configure(state="normal")
+                self.cancel_btn.configure(state="disabled")
+        if self.closing and (self.worker is None or not self.worker.is_alive()):
+            self.destroy()
+            return
+        self.after(80, self.poll_events)
+
+    def cancel_download(self):
+        self.cancel_event.set()
+        self.cancel_btn.configure(state="disabled")
+        self.status.configure(text="正在取消，等待目前連線結束…")
+
+    def on_close(self):
+        if self.worker is not None and self.worker.is_alive():
+            self.closing = True
+            self.cancel_download()
+            self.log("正在安全結束下載，完成暫存檔清理後會關閉視窗。")
         else:
-            update_log("❌檔案下載失敗 (伺服器無回應)")
-            
-    except Exception as e:
-        update_log(f"❌發生未預期的錯誤: {e}")
-        
-    finally:
-        # [完美修復]：確保按鈕恢復的動作也在主執行緒執行
-        app.after(0, lambda: download_btn.configure(state="normal", text="開始下載"))
+            self.destroy()
 
-# ==========================================
-# 3. 按鈕觸發與執行緒分流
-# ==========================================
-def start_download_thread():
-    user_id = entry_id.get()
-    user_pwd = entry_pwd.get()
-    target_url = entry_url.get()
-    remember = remember_var.get() 
-    
-    if not user_id or not user_pwd or not target_url:
-        update_log("⚠️請確實填寫學號、密碼與網址！")
-        return
-        
-    if remember:
-        data = {"username": user_id, "password": user_pwd, "remember": True}
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-    else:
-        if os.path.exists(CONFIG_FILE):
-            os.remove(CONFIG_FILE)
-            
-    download_btn.configure(state="disabled", text="下載中...")
-    
-    # 清空畫面時也要先解鎖再上鎖
-    log_box.configure(state="normal")
-    log_box.delete("0.0", "end") 
-    log_box.configure(state="disabled")
-    
-    worker = threading.Thread(target=nsysu_ultimate_downloader, args=(user_id, user_pwd, target_url))
-    worker.start()
+    def open_folder(self):
+        if self.last_directory:
+            try:
+                os.startfile(self.last_directory)
+            except (OSError, AttributeError):
+                self.log(f"請手動開啟：{self.last_directory}")
 
-# ==========================================
-# 4. GUI 元件排版設計
-# ==========================================
-title_label = ctk.CTkLabel(app, text="🎓 TronClass 下載器", font=("Arial", 24, "bold"))
-title_label.pack(pady=(20, 10))
 
-entry_id = ctk.CTkEntry(app, placeholder_text="請輸入學號 (如 B12345678)", width=350)
-entry_id.pack(pady=10)
-
-entry_pwd = ctk.CTkEntry(app, placeholder_text="請輸入 TronClass 密碼", show="*", width=350)
-entry_pwd.pack(pady=(10,2))
-
-remember_var = ctk.BooleanVar(value=False)
-remember_checkbox = ctk.CTkCheckBox(app , text='記住帳號密碼' ,variable= remember_var ,font = ('Arial',13) , checkbox_height=16 ,checkbox_width=16 , border_width=2)
-remember_checkbox.pack(pady = (0,5))
-
-entry_url = ctk.CTkEntry(app, placeholder_text="請貼上 learning-activity 網址", width=350)
-entry_url.pack(pady=10)
-
-download_btn = ctk.CTkButton(app, text="開始下載", command=start_download_thread, width=350, font=("Arial", 14, "bold"))
-download_btn.pack(pady=20)
-
-# [完美修復]：狀態顯示文字框，預設改為唯讀 (state="disabled")
-log_box = ctk.CTkTextbox(app, width=450, height=180, font=("Arial", 13), state="disabled")
-log_box.pack(pady=10)
-
-# 第一次寫入歡迎訊息
-log_box.configure(state="normal")
-log_box.insert("end", "歡迎使用！請輸入資料並點擊下載。\n")
-log_box.configure(state="disabled")
-
-# ==========================================
-# 5. 啟動時自動讀取帳號密碼
-# ==========================================
-def load_credentials():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if data.get("remember"):
-                    entry_id.insert(0, data.get("username", ""))
-                    entry_pwd.insert(0, data.get("password", ""))
-                    remember_var.set(True)
-        except Exception as e:
-            update_log(f"⚠️ 讀取設定檔失敗: {e}")
-
-load_credentials()
-
-# 啟動應用程式
-app.mainloop()
+if __name__ == "__main__":
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("blue")
+    DownloaderApp().mainloop()

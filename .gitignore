@@ -3,3 +3,6 @@ build/
 dist/
 *.spec
 config.json
+.venv/
+__pycache__/
+downloads/
