@@ -19,7 +19,7 @@ APP_DIRECTORY = Path(sys.executable).resolve().parent if getattr(sys, "frozen", 
 class DownloaderApp(ctk.CTk):
     def __init__(self, settings_directory=APP_DIRECTORY):
         super().__init__()
-        self.title("TronClass 下載器 — 課程批次下載")
+        self.title("TronClass 下載器 v2.2.0 — 課程批次下載")
         self.geometry("680x760")
         self.minsize(620, 720)
         self.config_file = Path(settings_directory) / "config.json"
