@@ -3,6 +3,8 @@
 輸入中山網路大學帳密、貼上課程網址，即可逐一下載該課程可存取的文件附件。
 提供 CustomTkinter 桌面介面，並保留單一活動下載模式。
 
+<img width="800" alt="TronClass 下載器操作畫面" src="https://github.com/user-attachments/assets/d0d04a4d-6115-45c6-a75f-da5ea7f0b620" />
+
 ## 課程批次下載（開發版）
 
 - **整門課教材**：取得章節與活動清單，再下載各活動的所有附件。
