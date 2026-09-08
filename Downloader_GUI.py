@@ -26,7 +26,6 @@ CONFIG_FILE = "config.json"
 # ==========================================
 # 2. 爬蟲核心與狀態回報機制
 # ==========================================
-# [完美修復]：使用 app.after 確保跨執行緒安全，並控制唯讀狀態
 def update_log(message):
     def _update():
         log_box.configure(state="normal")    # 寫入前先解鎖
