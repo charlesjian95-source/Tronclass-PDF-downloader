@@ -19,9 +19,9 @@ APP_DIRECTORY = Path(sys.executable).resolve().parent if getattr(sys, "frozen", 
 class DownloaderApp(ctk.CTk):
     def __init__(self, settings_directory=APP_DIRECTORY):
         super().__init__()
-        self.title("TronClass 下載器 v2.2.0 — 課程批次下載")
-        self.geometry("680x760")
-        self.minsize(620, 720)
+        self.title("TronClass 下載器 v2.3.0 — 教材與課程成員")
+        self.geometry("680x800")
+        self.minsize(620, 760)
         self.config_file = Path(settings_directory) / "config.json"
         self.events = queue.Queue()
         self.cancel_event = threading.Event()
@@ -29,7 +29,7 @@ class DownloaderApp(ctk.CTk):
         self.last_directory = None
         self.closing = False
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(9, weight=1)
+        self.grid_rowconfigure(10, weight=1)
 
         ctk.CTkLabel(self, text="TronClass 教材下載器", font=("Arial", 24, "bold")).grid(row=0, column=0, pady=(20, 12))
         account = ctk.CTkFrame(self)
@@ -70,15 +70,17 @@ class DownloaderApp(ctk.CTk):
         self.cancel_btn.grid(row=0, column=1, padx=6, sticky="ew")
         self.retry_btn = ctk.CTkButton(buttons, text="重新掃描並重試", state="disabled", command=self.start_download)
         self.retry_btn.grid(row=0, column=2, padx=(6, 0), sticky="ew")
+        self.members_btn = ctk.CTkButton(self, text="查看課程成員（需平台授權）", command=self.start_members)
+        self.members_btn.grid(row=7, column=0, padx=24, pady=(0, 14), sticky="ew")
         self.progress = ctk.CTkProgressBar(self)
         self.progress.set(0)
-        self.progress.grid(row=7, column=0, padx=24, sticky="ew")
+        self.progress.grid(row=8, column=0, padx=24, sticky="ew")
         self.status = ctk.CTkLabel(self, text="準備就緒", wraplength=600, anchor="w")
-        self.status.grid(row=8, column=0, padx=24, pady=8, sticky="ew")
+        self.status.grid(row=9, column=0, padx=24, pady=8, sticky="ew")
         self.log_box = ctk.CTkTextbox(self, state="disabled", height=190)
-        self.log_box.grid(row=9, column=0, padx=24, sticky="nsew")
+        self.log_box.grid(row=10, column=0, padx=24, sticky="nsew")
         self.open_btn = ctk.CTkButton(self, text="開啟下載資料夾", state="disabled", command=self.open_folder)
-        self.open_btn.grid(row=10, column=0, pady=16)
+        self.open_btn.grid(row=11, column=0, pady=16)
         self.inputs = [self.entry_id, self.entry_pwd, self.remember_box, self.mode, self.entry_url, self.output, self.browse_btn]
         self.load_credentials()
         self.log("貼上網址後開始下載。重試會重新讀取清單，並略過已完成且校驗一致的附件。")
@@ -141,9 +143,70 @@ class DownloaderApp(ctk.CTk):
             widget.configure(state="disabled")
         self.download_btn.configure(state="disabled")
         self.retry_btn.configure(state="disabled")
+        self.members_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
         self.worker = threading.Thread(target=self.run_worker, args=(username, password, target, root, whole_course), daemon=True)
         self.worker.start()
+
+    def start_members(self):
+        if self.worker is not None and self.worker.is_alive():
+            return
+        username, password = self.entry_id.get().strip(), self.entry_pwd.get()
+        target = self.entry_url.get().strip()
+        if not all((username, password, target)):
+            self.log("查看課程成員請填寫學號、密碼及課程網址。")
+            return
+        try:
+            parse_target(target)
+            if self.remember.get():
+                self.config_file.write_text(json.dumps({"username": username, "password": password, "remember": True}), encoding="utf-8")
+            else:
+                self.config_file.unlink(missing_ok=True)
+        except Exception as error:
+            self.log(describe_error(error))
+            return
+        self.cancel_event.clear()
+        self.status.configure(text="正在讀取課程成員…")
+        for widget in self.inputs:
+            widget.configure(state="disabled")
+        self.download_btn.configure(state="disabled")
+        self.retry_btn.configure(state="disabled")
+        self.members_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="normal")
+        self.worker = threading.Thread(target=self.run_members_worker, args=(username, password, target), daemon=True)
+        self.worker.start()
+
+    def run_members_worker(self, username, password, target):
+        client = TronClassClient(cancel=self.cancel_event)
+        try:
+            client.login(username, password)
+            self.events.put(("members", client.get_course_members(target)))
+        except Cancelled:
+            self.events.put(("status", "已取消"))
+        except Exception as error:
+            message = describe_error(error)
+            self.events.put(("log", message))
+            self.events.put(("status", message))
+        finally:
+            client.close()
+            self.events.put(("done", None))
+
+    def show_members(self, members):
+        if hasattr(self, "members_window") and self.members_window.winfo_exists():
+            self.members_window.destroy()
+        self.members_window = ctk.CTkToplevel(self)
+        self.members_window.title("課程成員")
+        self.members_window.geometry("520x560")
+        self.members_window.grid_columnconfigure(0, weight=1)
+        self.members_window.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(self.members_window, text=f"課程成員（{len(members)} 位）",
+                     font=("Arial", 18, "bold")).grid(row=0, column=0, padx=20, pady=16, sticky="w")
+        roster = ctk.CTkTextbox(self.members_window, wrap="word")
+        roster.grid(row=1, column=0, padx=20, pady=(0, 20), sticky="nsew")
+        roster.insert("1.0", "\n".join(f"{index}. {name}" for index, name in enumerate(members, 1))
+                      if members else "沒有可顯示的成員。")
+        roster.configure(state="disabled")
+        self.members_window.lift()
 
     def run_worker(self, username, password, target, root, whole_course):
         client = TronClassClient(cancel=self.cancel_event, emit=lambda kind, value: self.events.put((kind, value)))
@@ -183,11 +246,17 @@ class DownloaderApp(ctk.CTk):
                 self.log(f"檔案與下載報告：{value.directory}")
                 self.last_directory = value.directory
                 self.open_btn.configure(state="normal")
+            elif kind == "members":
+                summary = f"已取得 {len(value)} 位課程成員。"
+                self.status.configure(text=summary)
+                self.log(summary)
+                self.show_members(value)
             elif kind == "done":
                 for widget in self.inputs:
                     widget.configure(state="normal")
                 self.download_btn.configure(state="normal")
                 self.retry_btn.configure(state="normal")
+                self.members_btn.configure(state="normal")
                 self.cancel_btn.configure(state="disabled")
         if self.closing and (self.worker is None or not self.worker.is_alive()):
             self.destroy()
@@ -203,7 +272,7 @@ class DownloaderApp(ctk.CTk):
         if self.worker is not None and self.worker.is_alive():
             self.closing = True
             self.cancel_download()
-            self.log("正在安全結束下載，完成暫存檔清理後會關閉視窗。")
+            self.log("正在安全結束目前作業，完成後會關閉視窗。")
         else:
             self.destroy()
 

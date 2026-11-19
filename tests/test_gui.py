@@ -23,6 +23,10 @@ class GuiTests(unittest.TestCase):
                 app.cancel_download()
                 self.assertTrue(app.cancel_event.is_set())
                 self.assertEqual(app.entry_pwd.get(), "")
+                app.events.put(("members", ["甲同學", "乙同學"]))
+                app.poll_events()
+                self.assertEqual(app.members_window.title(), "課程成員")
+                self.assertIn("已取得 2 位", app.status.cget("text"))
             finally:
                 app.destroy()
 

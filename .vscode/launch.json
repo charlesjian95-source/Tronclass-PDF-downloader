@@ -1,0 +1,14 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "TronClass 下載器（專案 .venv）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/Downloader_GUI.py",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "console": "integratedTerminal"
+    }
+  ]
+}

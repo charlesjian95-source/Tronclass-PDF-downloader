@@ -1,7 +1,10 @@
+import hashlib
+import io
 import json
 from pathlib import Path
 import tempfile
 import unittest
+import zipfile
 from unittest.mock import Mock
 
 import requests
@@ -77,6 +80,94 @@ class BatchTests(unittest.TestCase):
         second = self.client.run(self.target, self.root)
         self.assertEqual((second.downloaded, second.skipped, second.failures), (0, 3, []))
         self.assertFalse(any("files.example" in call.args[1] for call in self.session.request.call_args_list))
+
+    def test_office_original_is_valid_and_pdf_preview_has_pdf_extension(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types/>")
+            archive.writestr("ppt/presentation.xml", "<presentation/>")
+        original = buffer.getvalue()
+        pdf = b"%PDF-1.7 converted preview\n%%EOF"
+
+        def route(method, url, **kwargs):
+            if "/document/" in url:
+                reference = url.split("/")[-2]
+                return Response({"url": f"https://files.example.test/{reference}"})
+            if url.endswith("/201"):
+                return Response(content=original)
+            if url.endswith("/202"):
+                return Response(content=pdf)
+            raise AssertionError(url)
+
+        self.session.request.side_effect = route
+        manifest = {}
+        self.assertEqual(self.client.download_one(1, {"name": "slides.pptx", "reference_id": 201}, self.root, manifest), "original")
+        self.assertTrue((self.root / "slides__201.pptx").is_file())
+        self.assertEqual(self.client.download_one(1, {"name": "slides.pptx", "reference_id": 202}, self.root, manifest), "preview")
+        self.assertEqual((self.root / "slides__202.pdf").read_bytes(), pdf)
+        self.assertFalse((self.root / "slides__202.pptx").exists())
+        self.assertEqual(manifest["1:202"]["kind"], "preview")
+
+    def test_office_403_uses_pdf_preview_and_rejects_bad_pptx(self):
+        pdf = b"%PDF-1.7 converted preview\n%%EOF"
+        requested = []
+        def route(method, url, **kwargs):
+            if "/document/" in url:
+                preview = kwargs["params"]["preview"]
+                requested.append(preview)
+                return Response(status=403) if preview == "false" else Response({"url": "https://files.example.test/preview"})
+            if url.endswith("/preview"):
+                return Response(content=pdf)
+            raise AssertionError(url)
+        self.session.request.side_effect = route
+        manifest = {}
+        self.assertEqual(self.client.download_one(1, {"name": "slides.pptx", "reference_id": 203}, self.root, manifest), "preview")
+        self.assertEqual(requested, ["false", "true"])
+        self.assertEqual((self.root / "slides__203.pdf").read_bytes(), pdf)
+
+        self.session.request.side_effect = lambda method, url, **kwargs: (
+            Response({"url": "https://files.example.test/bad"}) if "/document/" in url
+            else Response(content=b"not an Office file"))
+        with self.assertRaises(DownloadError):
+            self.client.download_one(1, {"name": "broken.pptx", "reference_id": 204}, self.root, manifest)
+        self.assertFalse((self.root / "broken__204.pptx").exists())
+        self.assertFalse(list(self.root.glob("*.part")))
+
+    def test_mislabeled_cached_pptx_is_not_skipped(self):
+        pdf = b"%PDF-1.7 converted preview\n%%EOF"
+        wrong = self.root / "slides__205.pptx"
+        wrong.write_bytes(pdf)
+        upload = {"name": "slides.pptx", "reference_id": 205}
+        manifest = {"1:205": {
+            "path": wrong.name, "size": len(pdf), "sha256": hashlib.sha256(pdf).hexdigest(),
+            "version": {key: upload.get(key) for key in ("name", "size", "updated_at", "md5", "sha256")},
+        }}
+        def route(method, url, **kwargs):
+            return Response({"url": "https://files.example.test/205"}) if "/document/" in url else Response(content=pdf)
+        self.session.request.side_effect = route
+        self.assertEqual(self.client.download_one(1, upload, self.root, manifest), "preview")
+        self.assertEqual(wrong.read_bytes(), pdf)
+        self.assertEqual((self.root / "slides__205.pdf").read_bytes(), pdf)
+        self.session.request.reset_mock()
+        self.assertFalse(self.client.download_one(1, upload, self.root, manifest))
+        self.session.request.assert_not_called()
+
+    def test_renamed_pdf_preview_is_reused_on_retry(self):
+        pdf = b"%PDF-1.7 converted preview\n%%EOF"
+        existing = self.root / "slides__206.pdf"
+        existing.write_bytes(pdf)
+        upload = {"name": "slides.pptx", "reference_id": 206}
+        manifest = {"1:206": {
+            "path": "slides__206.pptx", "size": len(pdf),
+            "sha256": hashlib.sha256(pdf).hexdigest(),
+            "version": {key: upload.get(key) for key in ("name", "size", "updated_at", "md5", "sha256")},
+        }}
+        self.session.request.side_effect = lambda method, url, **kwargs: (
+            Response({"url": "https://files.example.test/206"}) if "/document/" in url
+            else Response(content=pdf))
+        self.assertEqual(self.client.download_one(1, upload, self.root, manifest), "reused")
+        self.assertEqual(manifest["1:206"]["path"], existing.name)
+        self.assertEqual(list(self.root.glob("*.pdf")), [existing])
 
     def test_failure_does_not_stop_other_files_and_retry_recovers(self):
         def failure(method, url, **kwargs):
@@ -173,6 +264,39 @@ class BatchTests(unittest.TestCase):
             self.session.request.side_effect = [Response(text=form), Response(text=form)]
             with self.assertRaises(DownloadError):
                 self.client.login("test-user", "test-password")
+
+    def test_course_members_show_only_names_from_authorized_response(self):
+        self.session.request.return_value = Response({"result": {"members": [
+            {"name": "甲 同學", "email": "private@example.test", "student_id": "A001"},
+            {"user": {"display_name": "乙 同學", "email": "other@example.test"}},
+        ], "total": 2}})
+        self.assertEqual(self.client.get_course_members(self.target), ["甲 同學", "乙 同學"])
+        self.session.request.assert_called_once_with(
+            "GET", BASE_URL + "/api/courses/42/members", timeout=(10, 30), params=None)
+
+    def test_course_members_respect_permission_and_incomplete_response(self):
+        self.session.request.return_value = Response(status=403)
+        with self.assertRaisesRegex(DownloadError, "HTTP 403.*無法確認"):
+            self.client.get_course_members(self.target)
+        self.session.request.return_value = Response({"members": [{"name": "甲"}], "total": 2})
+        with self.assertRaisesRegex(DownloadError, "不完整"):
+            self.client.get_course_members(self.target)
+        self.session.request.return_value = Response({"members": [{"id": 1}]})
+        with self.assertRaisesRegex(DownloadError, "缺少姓名"):
+            self.client.get_course_members(self.target)
+
+    def test_course_members_distinguish_roster_permission_from_course_access(self):
+        def route(method, url, **kwargs):
+            if url.endswith("/members"):
+                return Response(status=403)
+            if url.endswith("/modules"):
+                return Response({"modules": []})
+            raise AssertionError(url)
+
+        self.session.request.side_effect = route
+        with self.assertRaisesRegex(DownloadError, "課程教材可讀.*HTTP 403"):
+            self.client.get_course_members(self.target)
+        self.assertEqual(self.session.request.call_count, 2)
 
     def test_bad_url_and_sensitive_error_redaction(self):
         for url in ["https://evil.example/course/42", BASE_URL + "/course/nope", "http://elearn.nsysu.edu.tw/course/42"]:

@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import threading
 import uuid
+import zipfile
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -16,6 +17,9 @@ from bs4 import BeautifulSoup
 BASE_URL = "https://elearn.nsysu.edu.tw"
 TIMEOUT = (10, 30)
 MEDIA_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m3u8", ".mp3", ".wav", ".m4a"}
+OFFICE_PARTS = {".pptx": "ppt/presentation.xml", ".docx": "word/document.xml", ".xlsx": "xl/workbook.xml"}
+LEGACY_OFFICE = {".ppt", ".doc", ".xls"}
+OLE_SIGNATURE = bytes.fromhex("d0cf11e0a1b11ae1")
 
 
 class DownloadError(Exception):
@@ -24,6 +28,12 @@ class DownloadError(Exception):
 
 class Cancelled(DownloadError):
     pass
+
+
+class HttpAccessError(DownloadError):
+    def __init__(self, status):
+        self.status = status
+        super().__init__(f"無法存取（HTTP {status}），請確認登入狀態及課程權限。")
 
 
 def parse_target(url):
@@ -83,6 +93,27 @@ def file_digest(path):
     return digest.hexdigest()
 
 
+def classify_download(path, suffix):
+    """Return the proper suffix and whether an Office file became a PDF preview."""
+    suffix = suffix.lower()
+    with path.open("rb") as stream:
+        header = stream.read(8)
+    if header.startswith(b"%PDF-"):
+        return ".pdf", suffix != ".pdf"
+    if suffix == ".pdf":
+        raise DownloadError("平台回傳的內容不是 PDF，已拒絕儲存錯誤檔案。")
+    if suffix in OFFICE_PARTS:
+        try:
+            with zipfile.ZipFile(path) as archive:
+                if OFFICE_PARTS[suffix] not in archive.namelist() or archive.testzip() is not None:
+                    raise DownloadError("Office 檔案內容不完整，請重新下載。")
+        except (zipfile.BadZipFile, RuntimeError):
+            raise DownloadError("平台回傳的內容不是有效的 Office 檔案，已拒絕儲存。") from None
+    if suffix in LEGACY_OFFICE and not header.startswith(OLE_SIGNATURE):
+        raise DownloadError("平台回傳的內容不是有效的舊版 Office 檔案，已拒絕儲存。")
+    return suffix, False
+
+
 def write_json(path, data):
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -110,7 +141,7 @@ class TronClassClient:
             status = response.status_code
             response.close()
             if status in (401, 403):
-                raise DownloadError(f"無法存取（HTTP {status}），請確認登入狀態及課程權限。")
+                raise HttpAccessError(status)
             raise DownloadError(f"伺服器回應 HTTP {status}，請稍後重試。")
         return response
 
@@ -120,7 +151,7 @@ class TronClassClient:
             try:
                 value = response.json()
             except ValueError:
-                raise DownloadError("伺服器未回傳教材資料，可能需要重新登入或網站格式已更新。") from None
+                raise DownloadError("伺服器未回傳預期資料，可能需要重新登入或網站格式已更新。") from None
             if not isinstance(value, (dict, list)):
                 raise DownloadError("伺服器回傳的資料格式不符預期。")
             return value
@@ -145,6 +176,56 @@ class TronClassClient:
             if soup.find("input", {"type": "password"}) or "Invalid username or password" in response.text:
                 raise DownloadError("登入未完成，請檢查帳密或是否需要額外驗證。")
         self.emit("log", "登入流程完成，正在確認課程存取權限…")
+
+    def get_course_members(self, target_url):
+        """Read only the roster the signed-in account is permitted to see."""
+        course_id, _ = parse_target(target_url)
+        try:
+            payload = self.get_json(f"/api/courses/{course_id}/members")
+        except HttpAccessError as error:
+            if error.status != 403:
+                raise
+            try:
+                self.get_json(f"/api/courses/{course_id}/modules")
+            except DownloadError:
+                raise DownloadError(
+                    "課程成員名單遭拒（HTTP 403），且無法確認此帳號是否能讀取課程教材；請檢查課程網址與登入狀態。"
+                ) from None
+            raise DownloadError(
+                "課程教材可讀，但 TronClass 拒絕此帳號查看成員名單（HTTP 403）。這是伺服器權限，下載器無法自行開啟。"
+            ) from None
+        value, total = payload, None
+        for _ in range(4):
+            if isinstance(value, list):
+                break
+            if not isinstance(value, dict):
+                break
+            for key in ("total", "total_count"):
+                count = value.get(key)
+                if isinstance(count, int) and count >= 0:
+                    total = count
+            for key in ("members", "users", "items", "result", "data"):
+                nested = value.get(key)
+                if isinstance(nested, (list, dict)):
+                    value = nested
+                    break
+            else:
+                break
+        if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
+            raise DownloadError("班級成員清單格式已變更，無法顯示名單。")
+        if total is not None and len(value) < total:
+            raise DownloadError("班級成員清單可能不完整，已停止顯示。")
+        names = []
+        for row in value:
+            user = row.get("user") if isinstance(row.get("user"), dict) else {}
+            profile = row.get("profile") if isinstance(row.get("profile"), dict) else {}
+            name = next((item[key] for item in (row, user, profile)
+                         for key in ("name", "display_name", "full_name", "real_name")
+                         if isinstance(item.get(key), str) and item[key].strip()), None)
+            if name is None:
+                raise DownloadError("班級成員資料缺少姓名，無法確認名單完整性。")
+            names.append(" ".join(name.split()))
+        return names
 
     def list_all(self, path, key, params=None):
         """Handle paged responses and the school's unpaged activities response.
@@ -194,6 +275,7 @@ class TronClassClient:
         reference = numeric_id(upload.get("reference_id"))
         key = f"{activity_id}:{reference}"
         name = str(upload.get("name") or f"附件_{reference}")
+        suffix = Path(name).suffix.lower()
         # Include remote metadata so changed uploads do not reuse a stale copy.
         version = {key: upload.get(key) for key in ("name", "size", "updated_at", "md5", "sha256")}
         saved = manifest.get(key)
@@ -202,25 +284,25 @@ class TronClassClient:
             if (existing.is_relative_to(directory.resolve()) and existing.is_file()
                     and existing.stat().st_size == saved.get("size")
                     and file_digest(existing) == saved.get("sha256")):
-                self.check_cancelled()
-                return False
+                try:
+                    detected_suffix, _ = classify_download(existing, existing.suffix)
+                except DownloadError:
+                    pass
+                else:
+                    if detected_suffix == existing.suffix.lower():
+                        self.check_cancelled()
+                        return False
 
-        suffix = Path(name).suffix
-        filename = (safe_name(Path(name).stem, 65) + "__" + reference + "." + safe_name(suffix[1:], 12)
-                    if suffix else safe_name(name, 65) + "__" + reference)
-        target = directory / filename
-        counter = 2
-        while target.exists():
-            target = directory / f"{Path(filename).stem} ({counter}){Path(filename).suffix}"
-            counter += 1
         temporary = directory / (uuid.uuid4().hex + ".part")
-        data = self.get_json(f"/api/uploads/reference/document/{reference}/url", {
-            "preview": "true", "refer_id": activity_id, "refer_type": "learning_activity",
-        })
-        real_url = data.get("url") if isinstance(data, dict) else None
-        if not isinstance(real_url, str) or urlparse(real_url).scheme != "https":
-            raise DownloadError("附件未提供有效的 HTTPS 下載網址。")
-        try:
+        def fetch(preview):
+            data = self.get_json(f"/api/uploads/reference/document/{reference}/url", {
+                "preview": "true" if preview else "false",
+                "refer_id": activity_id,
+                "refer_type": "learning_activity",
+            })
+            real_url = data.get("url") if isinstance(data, dict) else None
+            if not isinstance(real_url, str) or urlparse(real_url).scheme != "https":
+                raise DownloadError("附件未提供有效的 HTTPS 下載網址。")
             with self.request("GET", real_url, stream=True) as response:
                 if "text/html" in response.headers.get("Content-Type", "").lower():
                     raise DownloadError("下載回應是網頁而非附件，可能登入已過期。")
@@ -238,6 +320,35 @@ class TronClassClient:
                     raise DownloadError("附件傳輸不完整，請重試。")
                 if size == 0:
                     raise DownloadError("附件內容為空，請重試。")
+            return digest.hexdigest(), size
+
+        try:
+            try:
+                sha256, size = fetch(preview=False)
+                requested_preview = False
+            except HttpAccessError as error:
+                if error.status != 403:
+                    raise
+                sha256, size = fetch(preview=True)
+                requested_preview = True
+            actual_suffix, converted_preview = classify_download(temporary, suffix)
+            preview_only = converted_preview or requested_preview
+            stem = safe_name(Path(name).stem if suffix else name, 65) + "__" + reference
+            extension = ".pdf" if actual_suffix == ".pdf" else (
+                "." + safe_name(actual_suffix[1:], 12) if actual_suffix else "")
+            filename = stem + extension
+            target = directory / filename
+            counter = 2
+            while target.exists():
+                if (target.is_file() and target.stat().st_size == size
+                        and file_digest(target) == sha256):
+                    manifest[key] = {
+                        "path": target.name, "size": size, "sha256": sha256,
+                        "version": version, "kind": "preview" if preview_only else "original",
+                    }
+                    return "reused"
+                target = directory / f"{stem} ({counter}){extension}"
+                counter += 1
             # Exclusive creation protects existing files, including another running instance.
             with target.open("xb") as output, temporary.open("rb") as source:
                 try:
@@ -248,8 +359,11 @@ class TronClassClient:
                     output.close()
                     target.unlink(missing_ok=True)
                     raise
-            manifest[key] = {"path": target.name, "size": size, "sha256": digest.hexdigest(), "version": version}
-            return True
+            manifest[key] = {
+                "path": target.name, "size": size, "sha256": sha256,
+                "version": version, "kind": "preview" if preview_only else "original",
+            }
+            return "preview" if preview_only else "original"
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -324,10 +438,17 @@ class TronClassClient:
                     except (FileNotFoundError, ValueError):
                         manifest = {}
                     downloaded = self.download_one(aid, upload, directory, manifest)
-                    if downloaded:
+                    if downloaded == "reused":
+                        write_json(manifest_path, manifest)
+                        result.skipped += 1
+                        self.emit("log", f"已存在且校驗一致，略過：{name}")
+                    elif downloaded:
                         write_json(manifest_path, manifest)
                         result.downloaded += 1
-                        self.emit("log", f"已下載：{name}")
+                        if downloaded == "preview":
+                            self.emit("log", f"已儲存預覽：{name}（原始檔未提供，請以實際副檔名開啟）")
+                        else:
+                            self.emit("log", f"已下載：{name}")
                     else:
                         result.skipped += 1
                         self.emit("log", f"已存在且校驗一致，略過：{name}")
